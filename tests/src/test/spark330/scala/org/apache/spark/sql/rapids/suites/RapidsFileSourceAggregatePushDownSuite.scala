@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,26 @@
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.suites
 
-import org.apache.spark.sql.execution.datasources.parquet.ParquetProtobufCompatibilitySuite
-import org.apache.spark.sql.rapids.utils.{RapidsParquetResourceTest, RapidsSQLTestsBaseTrait}
+import org.apache.spark.sql.execution.datasources.{
+  OrcV1AggregatePushDownSuite,
+  OrcV2AggregatePushDownSuite,
+  ParquetV1AggregatePushDownSuite,
+  ParquetV2AggregatePushDownSuite
+}
+import org.apache.spark.sql.rapids.utils.RapidsSQLTestsBaseTrait
 
-class RapidsParquetProtobufCompatibilitySuite
-  extends ParquetProtobufCompatibilitySuite
+class RapidsParquetV1AggregatePushDownSuite
+  extends ParquetV1AggregatePushDownSuite
   with RapidsSQLTestsBaseTrait
-  with RapidsParquetResourceTest
+
+class RapidsParquetV2AggregatePushDownSuite
+  extends ParquetV2AggregatePushDownSuite
+  with RapidsSQLTestsBaseTrait
+
+class RapidsOrcV1AggregatePushDownSuite
+  extends OrcV1AggregatePushDownSuite
+  with RapidsSQLTestsBaseTrait
+
+class RapidsOrcV2AggregatePushDownSuite
+  extends OrcV2AggregatePushDownSuite
+  with RapidsSQLTestsBaseTrait

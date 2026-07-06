@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,15 @@
 /*** spark-rapids-shim-json-lines
 {"spark": "330"}
 spark-rapids-shim-json-lines ***/
-package org.apache.spark.sql.rapids.suites
+package org.apache.spark.sql.rapids.utils
 
-import org.apache.spark.sql.execution.datasources.parquet.ParquetProtobufCompatibilitySuite
-import org.apache.spark.sql.rapids.utils.{RapidsParquetResourceTest, RapidsSQLTestsBaseTrait}
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.execution.datasources.parquet.ParquetTest
 
-class RapidsParquetProtobufCompatibilitySuite
-  extends ParquetProtobufCompatibilitySuite
-  with RapidsSQLTestsBaseTrait
-  with RapidsParquetResourceTest
+trait RapidsParquetResourceTest extends ParquetTest {
+  this: RapidsSQLTestsBaseTrait =>
+
+  override protected def readResourceParquetFile(name: String): DataFrame = {
+    spark.read.parquet(testFile(name))
+  }
+}

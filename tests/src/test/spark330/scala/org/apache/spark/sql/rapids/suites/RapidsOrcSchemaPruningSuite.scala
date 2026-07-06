@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,14 +19,19 @@
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.suites
 
+import com.nvidia.spark.rapids.GpuOrcScan
+import com.nvidia.spark.rapids.shims.GpuBatchScanExec
+
+import org.apache.spark.SparkConf
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.execution.FileSourceScanExec
-import org.apache.spark.sql.execution.datasources.parquet.ParquetSchemaPruningSuite
+import org.apache.spark.sql.execution.datasources.orc.{OrcV1SchemaPruningSuite, OrcV2SchemaPruningSuite}
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.rapids.GpuFileSourceScanExec
 import org.apache.spark.sql.rapids.utils.{RapidsSchemaPruningTestUtils, RapidsSQLTestsBaseTrait}
 
-class RapidsParquetSchemaPruningSuite
-  extends ParquetSchemaPruningSuite
+class RapidsOrcV1SchemaPruningSuite
+  extends OrcV1SchemaPruningSuite
   with RapidsSQLTestsBaseTrait
   with RapidsSchemaPruningTestUtils {
 
@@ -35,7 +40,26 @@ class RapidsParquetSchemaPruningSuite
       expectedSchemaCatalogStrings: String*): Unit = {
     checkScanSchema(df, expectedSchemaCatalogStrings: _*) {
       case scan: FileSourceScanExec => scan.requiredSchema
-      case gpuScan: GpuFileSourceScanExec => gpuScan.requiredSchema
+      case scan: GpuFileSourceScanExec => scan.requiredSchema
+    }
+    df.collect()
+  }
+}
+
+class RapidsOrcV2SchemaPruningSuite
+  extends OrcV2SchemaPruningSuite
+  with RapidsSQLTestsBaseTrait
+  with RapidsSchemaPruningTestUtils {
+
+  override def sparkConf: SparkConf =
+    super.sparkConf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, "false")
+
+  override protected def checkScan(
+      df: DataFrame,
+      expectedSchemaCatalogStrings: String*): Unit = {
+    checkScanSchema(df, expectedSchemaCatalogStrings: _*) {
+      case scan: GpuBatchScanExec if scan.scan.isInstanceOf[GpuOrcScan] =>
+        scan.scan.asInstanceOf[GpuOrcScan].readDataSchema
     }
     df.collect()
   }

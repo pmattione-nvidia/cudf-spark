@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2026, NVIDIA CORPORATION.
+ * Copyright (c) 2026, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,10 +19,10 @@
 spark-rapids-shim-json-lines ***/
 package org.apache.spark.sql.rapids.suites
 
-import org.apache.spark.sql.execution.datasources.parquet.ParquetProtobufCompatibilitySuite
+import org.apache.spark.sql.execution.datasources.parquet.ParquetIOSuite
 import org.apache.spark.sql.rapids.utils.{RapidsParquetResourceTest, RapidsSQLTestsBaseTrait}
 
-class RapidsParquetProtobufCompatibilitySuite
-  extends ParquetProtobufCompatibilitySuite
+class RapidsParquetIOSuite
+  extends ParquetIOSuite
   with RapidsSQLTestsBaseTrait
   with RapidsParquetResourceTest
