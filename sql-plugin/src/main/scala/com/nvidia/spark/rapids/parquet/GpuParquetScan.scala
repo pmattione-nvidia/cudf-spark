@@ -1332,6 +1332,25 @@ abstract class AbstractGpuParquetMultiFilePartitionReaderFactory(
   protected val compressCfg = CpuCompressionConfig.forParquet(rapidsConf)
   protected val skipReadEstimate = rapidsConf.skipReadEstimate(useChunkedReader)
 
+  // Set only for an eligible scan; scopes hybrid to the MULTITHREADED cloud reader path. Mirrors
+  // the per-file factory's eligibility check so the two paths gate identically.
+  protected val hybridScanConfig: Option[HybridScanConfig] =
+    if (rapidsConf.isParquetHybridScanEnabled) {
+      val config = HybridScanConfig(rapidsConf,
+        new HybridScanFilters(readDataSchema, isCaseSensitive, filters))
+      val eligible = HybridScanParquetPartitionReader.isEligible(
+        rapidsConf.isParquetHybridScanEnabled, rapidsConf.testParquetHybridScanFailOnFallback,
+        readDataSchema, config.filters,
+        useChunkedReader, compressCfg.decompressSnappyCpu || compressCfg.decompressZstdCpu,
+        readUseFieldId, sqlConf.ignoreCorruptFiles,
+        GpuParquetFileFilterHandler.isDecryptionConfigured(broadcastedConf.value.value),
+        DateTimeRebaseMode.fromName(SparkShimImpl.parquetRebaseRead(sqlConf)),
+        DateTimeRebaseMode.fromName(SparkShimImpl.int96ParquetRebaseRead(sqlConf)))
+      if (eligible) Some(config) else None
+    } else {
+      None
+    }
+
   // We can't use the coalescing files reader when InputFileName, InputFileBlockStart,
   // or InputFileBlockLength because we are combining all the files into a single buffer
   // and we don't know which file is associated with each row.
@@ -1586,6 +1605,19 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       keepReadsInOrder: Boolean,
       combineConf: CombineConf
   ): AbstractMultiFileCloudParquetPartitionReader = {
+    // Not in the shared base because this is the only cloud reader that currently runs hybrid.
+    val hybridScan = hybridScanConfig.map { config =>
+      val options = HybridScanParquetPartitionReader.parquetOptions(readDataSchema.fieldNames)
+      // The footer read needs the filter handler only the factory has, so hand it down as a
+      // closure the pool thread runs per file.
+      val readFooter = (file: PartitionedFile, fileConf: Configuration) => {
+        val filePath = new Path(new URI(file.filePath.toString()))
+        NvtxRegistry.HYBRID_SCAN_READ_FOOTER {
+          filterHandler.readThriftFooter(fileIO, filePath, fileConf)
+        }
+      }
+      HybridScanMultiFileConf(config, readDataSchema, options, readFooter)
+    }
     new MultiFileCloudParquetPartitionReader(
       fileIO,
       conf,
@@ -1611,7 +1643,8 @@ case class GpuParquetMultiFilePartitionReaderFactory(
       useFieldId,
       queryUsesInputFile,
       keepReadsInOrder,
-      combineConf)
+      combineConf,
+      hybridScan)
   }
 }
 
@@ -2899,6 +2932,18 @@ trait HostMemoryBuffersWithMetaData extends HostMemoryBuffersWithMetaDataBase {
 }
 
 /**
+ * What the `MULTITHREADED` reader needs to run a hybrid read per file, worked out once for the
+ * scan. None unless the scan is eligible for the hybrid path; set only then, which is what turns
+ * the reader's hybrid branch on. `readFooter` reads a file's thrift footer, which needs the
+ * filter handler only the factory has, so it is passed in as a closure.
+ */
+private[parquet] case class HybridScanMultiFileConf(
+    config: HybridScanConfig,
+    readDataSchema: StructType,
+    parquetOptions: ParquetOptions,
+    readFooter: (PartitionedFile, Configuration) => HostMemoryBuffer)
+
+/**
  * A PartitionReader that can read multiple Parquet files in parallel. This is most efficient
  * running in a cloud environment where the I/O of reading is slow.
  *
@@ -2958,7 +3003,8 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    hybridScan: Option[HybridScanMultiFileConf] = None)
   extends MultiFileCloudPartitionReaderBase(conf,
     files, poolConf, maxNumFileProcessed, null,
     execMetrics, maxReadBatchSizeRows, maxReadBatchSizeBytes, ignoreCorruptFiles,
@@ -2985,7 +3031,11 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
   }
 
   override def canUseCombine: Boolean = {
-    if (queryUsesInputFile) {
+    if (hybridScan.isDefined) {
+      // The hybrid path decodes one batch per file with no synthetic Parquet to stitch together,
+      // and its carrier is not a combinable buffer.
+      false
+    } else if (queryUsesInputFile) {
       logDebug("Query uses input file name, can't use combine mode")
       false
     } else {
@@ -3257,6 +3307,27 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
       metadata: HostMemoryBuffersWithMetaDataBase
   ): Int
 
+  /**
+   * A hybrid read's result crossing from the pool thread to the task thread: the footer to
+   * re-parse (its plan-phase reader cannot cross threads) and the fetched column chunks, both
+   * spillable so the pool's memory budget covers them, plus the row groups the plan kept. It is
+   * not a parquet-mr buffer, so it decodes on its own [[readBatches]] branch rather than through
+   * [[readBufferToBatches]].
+   */
+  private case class HybridHostMemoryBuffersWithMetaData(
+      override val partitionedFile: PartitionedFile,
+      footer: SpillableHostBuffer,
+      rowGroups: Array[Int],
+      override val memBuffersAndSizes: Array[SingleHMBAndMeta],
+      override val bytesRead: Long)
+    extends HostMemoryBuffersWithMetaDataBase {
+    // SpillableHostBuffer.close is idempotent, so this stays idempotent like the base close.
+    override def close(): Unit = {
+      footer.close()
+      super.close()
+    }
+  }
+
   private class ReadBatchRunner(
       file: PartitionedFile,
       filterFunc: PartitionedFile => ParquetFileInfoWithBlockMeta,
@@ -3319,7 +3390,103 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
       }
     }
 
-    private def doRead(): HostMemoryBuffersWithMetaDataBase = {
+    private def doRead(): HostMemoryBuffersWithMetaDataBase = hybridScan match {
+      case Some(h) => doHybridRead(h)
+      case None => doParquetMrRead()
+    }
+
+    /**
+     * The hybrid pool phase: parse the footer, prune the split's row groups with the pushed
+     * filter and fetch the surviving column chunks into host memory. No GPU work runs here, so it
+     * stays on the shared pool. The fetched chunks and the footer are handed to the task thread
+     * through a spillable carrier.
+     */
+    private def doHybridRead(h: HybridScanMultiFileConf): HostMemoryBuffersWithMetaDataBase = {
+      val startingBytesRead = fileSystemBytesRead()
+      val filterStartTime = System.nanoTime()
+      val footer = h.readFooter(file, conf)
+      val filterTime = System.nanoTime() - filterStartTime
+      val bufferStartTime = System.nanoTime()
+      val result = withResource(footer) { _ =>
+        val plannedOpt = planAndFetchForPool(h, footer)
+        val bytesRead = fileSystemBytesRead() - startingBytesRead
+        plannedOpt match {
+          case None =>
+            // No row group in this split survived, so there is nothing to decode. Rebase modes
+            // and the clipped schema do not matter for an empty result.
+            newHMEmptyMetadataForChunks(file, 0, bytesRead, DateTimeRebaseException,
+              DateTimeRebaseException, hasInt96Timestamps = false, null, h.readDataSchema, 0,
+              Seq.empty)
+          case Some((fetched, numRows)) =>
+            withResource(fetched) { f =>
+              buildHybridCarrier(footer, f, numRows, bytesRead)
+            }
+        }
+      }
+      result.setExecutionTime(filterTime, System.nanoTime() - bufferStartTime)
+      result
+    }
+
+    /**
+     * Pool-thread planning: open the footer, prune the split's row groups on statistics with the
+     * pushed filter and fetch the surviving column chunks into host memory. Returns the fetched
+     * chunks with the surviving row count (taken while the reader is open), or None when nothing
+     * survived.
+     */
+    private def planAndFetchForPool(
+        h: HybridScanMultiFileConf,
+        footer: HostMemoryBuffer): Option[(FetchedColumnChunks, Long)] = {
+      val filePath = new Path(new URI(file.filePath.toString()))
+      val source = new HybridScanFileByteSource(fileIO, filePath, execMetrics)
+      val hybridFile = HybridScanFile(source, file.start, file.length, h.parquetOptions,
+        h.readDataSchema, h.config.filters, h.config.filterKeepThreshold, execMetrics)
+      withResource(HybridScanParquetPartitionReader.openReader(footer, h.parquetOptions)) {
+        reader =>
+          withResource(h.config.filters.ast.map(_.compile())) { ast =>
+            // Statistics pruning only on this path for now: dictionary pruning compares pages on
+            // the GPU, which a pool thread may not touch. Accept-over-fetch moves it onto the task
+            // thread later.
+            HybridScanParquetPartitionReader.planAndFetch(hybridFile, reader, ast,
+                allowDictionaryPruning = false).map { fetched =>
+              closeOnExcept(fetched) { f =>
+                // The surviving row groups' row count, taken while the reader is open so the
+                // framework does not mistake a buffer with rows for an empty one. The pushed
+                // filter may still drop rows at decode; this is the upper bound.
+                (f, reader.totalRowsInRowGroups(f.rowGroups))
+              }
+            }
+          }
+      }
+    }
+
+    /**
+     * Wrap the fetched chunks and the footer in a spillable carrier for the task thread. Both ride
+     * the spill framework so the pool's memory budget bounds them and they can spill under
+     * pressure, as the parquet-mr path does with its read buffers. Each spillable owns an
+     * incremented reference; withResource/closeOnExcept close the originals.
+     */
+    private def buildHybridCarrier(
+        footer: HostMemoryBuffer,
+        fetched: FetchedColumnChunks,
+        numRows: Long,
+        bytesRead: Long): HybridHostMemoryBuffersWithMetaData = {
+      footer.incRefCount()
+      closeOnExcept(SpillableHostBuffer(footer, footer.getLength,
+          SpillPriorities.ACTIVE_BATCHING_PRIORITY)) { spillFooter =>
+        val spillChunks = fetched.hostChunks.safeMap { hmb =>
+          hmb.incRefCount()
+          SpillableHostBuffer(hmb, hmb.getLength, SpillPriorities.ACTIVE_BATCHING_PRIORITY)
+        }
+        closeOnExcept(spillChunks) { _ =>
+          val meta = SingleHMBAndMeta(spillChunks, spillChunks.map(_.length).sum, numRows,
+            Seq.empty)
+          HybridHostMemoryBuffersWithMetaData(file, spillFooter, fetched.rowGroups,
+            Array(meta), bytesRead)
+        }
+      }
+    }
+
+    private def doParquetMrRead(): HostMemoryBuffersWithMetaDataBase = {
       val startingBytesRead = fileSystemBytesRead()
       val hostBuffers = new ArrayBuffer[SingleHMBAndMeta]
       var filterTime = 0L
@@ -3474,7 +3641,49 @@ abstract class AbstractMultiFileCloudParquetPartitionReader(
         currentFileHostBuffers = None
       }
       batchIter
+
+    case hybrid: HybridHostMemoryBuffersWithMetaData =>
+      // The whole result is one batch, decoded eagerly, so the carrier's host buffers are closed
+      // as soon as we are done with them, matching the single-buffer parquet-mr case.
+      val batchIter = try {
+        readHybridBatches(hybrid, hybridScan.get)
+      } finally {
+        hybrid.close()
+      }
+      currentFileHostBuffers = None
+      batchIter
+
     case _ => throw new RuntimeException("Wrong HostMemoryBuffersWithMetaData")
+  }
+
+  /**
+   * Decode one hybrid-read result on the task thread: re-parse the footer the pool fetched with,
+   * since its plan-phase reader cannot cross threads, then run the materialize phase on the
+   * fetched chunks under the GPU semaphore.
+   */
+  private def readHybridBatches(buffer: HybridHostMemoryBuffersWithMetaData,
+      h: HybridScanMultiFileConf): Iterator[ColumnarBatch] = {
+    val partedFile = buffer.partitionedFile
+    val filePath = new Path(new URI(partedFile.filePath.toString()))
+    val source = new HybridScanFileByteSource(fileIO, filePath, execMetrics)
+    val hybridFile = HybridScanFile(source, partedFile.start, partedFile.length, h.parquetOptions,
+      h.readDataSchema, h.config.filters, h.config.filterKeepThreshold, execMetrics)
+    val spillChunks = buffer.memBuffersAndSizes.head.hmbs
+    val table = withResource(buffer.footer.getDataHostBuffer()) { footerBuf =>
+      withResource(new FetchedColumnChunks(buffer.rowGroups,
+          spillChunks.safeMap(_.getDataHostBuffer()))) { fetched =>
+        HybridScanParquetPartitionReader.decodeFetched(hybridFile, footerBuf, fetched)
+      }
+    }
+    val colTypes = h.readDataSchema.fields.map(_.dataType)
+    val batchIter: Iterator[ColumnarBatch] = table match {
+      case Some(t) => Iterator.single(withResource(t)(GpuColumnVector.from(_, colTypes)))
+      case None => Iterator.empty
+    }
+    batchIter.flatMap { batch =>
+      BatchWithPartitionDataUtils.addSinglePartitionValueToBatch(batch,
+        partedFile.partitionValues, partitionSchema, maxGpuColumnSizeBytes)
+    }
   }
 
   protected def readBufferToBatches(buffer: HostMemoryBuffersWithMetaData): Iterator[ColumnarBatch]
@@ -3505,13 +3714,14 @@ class MultiFileCloudParquetPartitionReader(
     useFieldId: Boolean,
     queryUsesInputFile: Boolean,
     keepReadsInOrder: Boolean,
-    combineConf: CombineConf)
+    combineConf: CombineConf,
+    hybridScan: Option[HybridScanMultiFileConf] = None)
   extends AbstractMultiFileCloudParquetPartitionReader(fileIO, conf, files, filterFunc,
     isSchemaCaseSensitive, debugDumpPrefix, debugDumpAlways, maxReadBatchSizeRows,
     maxReadBatchSizeBytes, targetBatchSizeBytes, maxGpuColumnSizeBytes, useChunkedReader,
     maxChunkedReaderMemoryUsageSizeBytes, skipReadEstimate, compressCfg, execMetrics,
     partitionSchema, poolConf, maxNumFileProcessed, ignoreMissingFiles, ignoreCorruptFiles,
-    useFieldId, queryUsesInputFile, keepReadsInOrder, combineConf) {
+    useFieldId, queryUsesInputFile, keepReadsInOrder, combineConf, hybridScan) {
 
   override protected def readBufferToBatches(buffer: HostMemoryBuffersWithMetaData)
   : Iterator[ColumnarBatch] = {
